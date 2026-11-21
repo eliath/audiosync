@@ -95,6 +95,9 @@ pub(super) struct Ap2Active {
     ptp_unproven: bool,
     /// The P179 restart entry it started with, which a P228 restart keeps.
     ptp_restart: Option<Option<bool>>,
+    /// It asks for NTP first to free the service for a waiter, which a
+    /// P228 restart keeps (P205).
+    ntp_first: bool,
 }
 
 impl Ap2Active {
@@ -231,6 +234,7 @@ impl Driver {
         }
         let peers = self.listed_peers(Some(key));
         let claimed = self.claim_held(key, ptp_v6);
+        let ntp_first = self.ntp_first.remove(key);
         let Some(speaker) = self.speakers.get_mut(key) else {
             return;
         };
@@ -261,7 +265,7 @@ impl Driver {
         config.peers = peers;
         // PTP first whenever the service gave this receiver a peer (P157);
         // the session falls back to NTP if the receiver refuses it.
-        config.timing = if ptp_configured {
+        config.timing = if ptp_configured && !ntp_first {
             Timing::Ptp
         } else {
             Timing::Ntp
@@ -303,8 +307,9 @@ impl Driver {
             ptp_configured,
             ptp_served: false,
             ntp_chosen: false,
-            ptp_unproven: ptp_configured && !remembered,
+            ptp_unproven: ptp_configured && !remembered && !ntp_first,
             ptp_restart: restart,
+            ntp_first,
         }));
         self.sessions.insert(session_key, key.clone());
         self.sessions.insert(events_key, key.clone());
@@ -591,10 +596,10 @@ impl Driver {
     /// Closes the service once no session takes PTP or may still take it;
     /// NTP sessions never hold it open (P205).
     pub(super) fn close_unused_ptp(&mut self) {
-        let used = self
-            .speakers
-            .values()
-            .any(|speaker| matches!(&speaker.phase, Phase::Ap2(active) if active.may_take_ptp()));
+        let used = !self.ntp_first.is_empty()
+            || self.speakers.values().any(
+                |speaker| matches!(&speaker.phase, Phase::Ap2(active) if active.may_take_ptp()),
+            );
         if !used {
             self.close_ptp();
         }
@@ -731,11 +736,14 @@ impl Driver {
     }
 
     /// Whether another speaker's AirPlay 2 session may use the PTP
-    /// service, which then stays in its family (P158, P205).
+    /// service, or a restart that asks for NTP first holds it, so it stays
+    /// in its family (P158, P205).
     fn ptp_shared(&self, key: &DeviceKey) -> bool {
-        self.speakers.iter().any(|(other, speaker)| {
-            other != key && matches!(&speaker.phase, Phase::Ap2(active) if active.may_take_ptp())
-        })
+        !self.ntp_first.is_empty()
+            || self.speakers.iter().any(|(other, speaker)| {
+                other != key
+                    && matches!(&speaker.phase, Phase::Ap2(active) if active.may_take_ptp())
+            })
     }
 
     /// The address family, IPv6 when true, of the PTP service for a
@@ -843,26 +851,29 @@ impl Driver {
         let Some(speaker) = self.speakers.get(key) else {
             return;
         };
-        let restart = match &speaker.phase {
+        let (restart, ntp_first) = match &speaker.phase {
             Phase::Ap2(active)
                 if active
                     .session
                     .restarts_on(&speaker.device.airplay_socket_addrs()) =>
             {
-                active.ptp_restart
+                (active.ptp_restart, active.ntp_first)
             }
             Phase::Active(active)
                 if active
                     .session
                     .restarts_on(&speaker.device.connect_socket_addrs()) =>
             {
-                None
+                (None, false)
             }
             _ => return,
         };
         let kind = speaker.started_as;
         if let Some(restart) = restart {
             self.ptp_restart.insert(key.clone(), restart);
+        }
+        if ntp_first {
+            self.ntp_first.insert(key.clone());
         }
         self.end_session(key, Phase::Idle);
         if let Some(speaker) = self.speakers.get_mut(key) {
@@ -892,6 +903,61 @@ impl Driver {
         self.ptp_restart.insert(key.clone(), family);
         self.end_session(key, Phase::Idle);
         self.start_session(key, StartKind::Host, now);
+    }
+
+    /// While a standalone receiver waits for the service, and every session
+    /// that holds it took PTP only because it was asked first, those start
+    /// again asking for NTP first; the service goes to the waiter once they
+    /// take NTP. A target member waits as before: its target keeps the
+    /// service's family (P205).
+    pub(super) fn free_ptp_for_waiter(&mut self, now: Instant) -> bool {
+        // A restart that ended before its session (removed, lapsed, failed,
+        // or waiting out a back-off) no longer keeps the service.
+        let pending = self.ntp_first.len();
+        let speakers = &self.speakers;
+        self.ntp_first.retain(|key| {
+            speakers.get(key).is_some_and(|speaker| {
+                !speaker.removing && matches!(speaker.phase, Phase::Queued { .. } | Phase::Idle)
+            })
+        });
+        if self.ntp_first.len() < pending {
+            self.close_unused_ptp();
+        }
+        let waiting = self.speakers.values().any(|speaker| {
+            speaker.ptp_waiting
+                && !speaker.removing
+                && speaker.target.is_none()
+                && matches!(speaker.phase, Phase::Failed)
+        });
+        if !waiting || self.stopping.is_some() {
+            return false;
+        }
+        let mut holders = Vec::new();
+        for (key, speaker) in &self.speakers {
+            let Phase::Ap2(active) = &speaker.phase else {
+                continue;
+            };
+            if !active.may_take_ptp() {
+                continue;
+            }
+            if !active.ptp_unproven {
+                return false;
+            }
+            // Its TEARDOWN frees the service soon; it must not start again.
+            if !speaker.removing {
+                holders.push(key.clone());
+            }
+        }
+        let restarted = !holders.is_empty();
+        for key in holders {
+            self.ntp_first.insert(key.clone());
+            if self.is_target_member(&key) {
+                self.note_teardown(key.clone(), now);
+            }
+            self.end_session(&key, Phase::Idle);
+            self.start_session(&key, StartKind::Host, now);
+        }
+        restarted
     }
 
     /// Sends what the PTP service queued; a Sync's Follow_Up carries the

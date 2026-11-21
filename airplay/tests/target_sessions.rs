@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use audiosync_airplay::ap2::bodies;
+use audiosync_airplay::ap2::{Timing, bodies};
 use audiosync_airplay::clock::SenderClock;
 use audiosync_airplay::discovery::{
     BrowseEvent, Browser, Device, DeviceId, DeviceKey, ProtocolPath, ScopedAddr, ServiceKind,
@@ -27,7 +27,8 @@ use audiosync_airplay::pairing::{Credentials, SECRET_BYTES};
 use audiosync_airplay::ptp::{PtpPorts, PtpService};
 use audiosync_airplay::secret::Secret;
 use audiosync_airplay::sender::{
-    Sender, SenderConfig, SenderEvent, SpeakerEvent, SpeakerOptions, SpeakerState, member_options,
+    Sender, SenderConfig, SenderEvent, SpeakerEvent, SpeakerOptions, SpeakerState, TimingMemory,
+    member_options,
 };
 use audiosync_airplay::targets::{Member, Target, TargetId, TargetKind};
 use audiosync_airplay::volume::Volume;
@@ -1698,6 +1699,187 @@ fn a_member_whose_ipv6_address_is_closed_plays_on_ipv4_with_ntp() {
         states_of(&events, &da.key),
         [SpeakerState::Connecting, SpeakerState::Playing]
     );
+    sender.shutdown();
+}
+
+/// A receiver at the IPv6 loopback address alone that sets bit 41, or None
+/// where the runner has no IPv6 loopback.
+fn ipv6_only(fake: FakeAp2, n: u8) -> Option<(Ap2Server, Device)> {
+    let Some(v6) = ipv6_loopback() else {
+        skipped("no IPv6 loopback");
+        return None;
+    };
+    let server = Ap2Server::start_on(v6, fake);
+    let mut record = airplay_record(server.address.port(), n, "0x0,0x10240");
+    record.addresses = vec![ScopedAddr::new(v6)];
+    let device =
+        Device::from_records(DeviceKey::Id(device_id(n)), None, Some(&record)).expect("device");
+    Some((server, device))
+}
+
+fn assert_state(
+    events: &mut Events,
+    sender: &Sender,
+    key: &DeviceKey,
+    nth: usize,
+    state: SpeakerState,
+) {
+    let found = events.wait_state(sender, key, nth, LONG, |s| *s == state);
+    assert!(found.is_some(), "{:?}", events.of(key));
+}
+
+// A speaker that takes both timings holds the PTP service over IPv4 when
+// one that takes only PTP, at an IPv6 address alone, comes: asked for NTP
+// first, the first takes it, so the second gets the service and both play
+// (P205).
+// covers: P205
+#[test]
+fn a_speaker_that_takes_both_timings_leaves_the_service_to_one_that_takes_only_ptp() {
+    let _serial = serial();
+    let Some((second, db)) = ipv6_only(ptp_fake(), 2) else {
+        return;
+    };
+    let first = Ap2Server::start(both_timings_fake());
+    let listener = PtpListener::bind_at(db.airplay_socket_addrs()[0].ip());
+    let (sender, _host) = ptp_sender(&listener);
+    let mut events = Events::default();
+    let da = airplay2_only(&first, 1, "0x0,0x10240");
+    sender.add_speaker(da.clone(), options());
+    assert_state(&mut events, &sender, &da.key, 1, SpeakerState::Playing);
+    sender.add_speaker(db.clone(), options());
+    assert_state(&mut events, &sender, &db.key, 1, SpeakerState::Playing);
+    assert_state(&mut events, &sender, &da.key, 2, SpeakerState::Playing);
+    assert_eq!(setup_timings(&first), ["PTP", "NTP"]);
+    assert_eq!(setup_timings(&second), ["NTP", "PTP"]);
+    assert_one_clock_keeps_syncing(&listener);
+    sender.shutdown();
+}
+
+// As above, but the first takes only PTP too: it refuses NTP and takes PTP
+// back from the service it kept, so it plays on, is remembered, and the
+// second waits, as when NTP came first (P205, P217).
+// covers: P205
+#[test]
+fn two_speakers_that_take_only_ptp_in_two_families_settle_with_one_waiting() {
+    let _serial = serial();
+    let Some((second, db)) = ipv6_only(ptp_fake(), 2) else {
+        return;
+    };
+    let first = Ap2Server::start(ptp_fake());
+    let listener = PtpListener::bind();
+    let (sender, _host) = ptp_sender(&listener);
+    let mut events = Events::default();
+    let da = airplay2_only(&first, 1, "0x0,0x10240");
+    sender.add_speaker(da.clone(), options());
+    assert_state(&mut events, &sender, &da.key, 1, SpeakerState::Playing);
+    sender.add_speaker(db.clone(), options());
+    assert_state(&mut events, &sender, &da.key, 2, SpeakerState::Playing);
+    assert_state(&mut events, &sender, &db.key, 1, SpeakerState::Failed);
+    // Neither starts again.
+    let connecting = |s: &SpeakerState| *s == SpeakerState::Connecting;
+    let again = events.wait_state(&sender, &db.key, 2, Duration::from_secs(2), connecting);
+    assert_eq!(again, None, "{:?}", events.of(&db.key));
+    assert_eq!(
+        errors(&events, &db.key).last(),
+        Some(&ErrorKind::Unsupported(UnsupportedReason::PtpOtherNetwork))
+    );
+    let remembered = |key: &DeviceKey| {
+        events.of(key).iter().any(
+            |event| matches!(event, SpeakerEvent::TimingRemembered(m) if m.timing == Timing::Ptp),
+        )
+    };
+    assert!(remembered(&da.key) && !remembered(&db.key));
+    assert_eq!(setup_timings(&first), ["PTP", "NTP", "PTP"]);
+    assert_eq!(setup_timings(&second), ["NTP"]);
+    assert_one_clock_keeps_syncing(&listener);
+    sender.shutdown();
+}
+
+// A remembered PTP-only speaker and one asked for PTP first both hold the
+// service over IPv4, so an IPv6-only PTP-only speaker waits; once the
+// remembered one leaves, the other gives the service up and the waiter
+// starts (P205).
+// covers: P205
+#[test]
+fn a_waiter_gets_the_service_once_the_remembered_holder_leaves() {
+    let _serial = serial();
+    let Some((_second, db)) = ipv6_only(ptp_fake(), 2) else {
+        return;
+    };
+    let proven = Ap2Server::start(ptp_fake());
+    let first = Ap2Server::start(both_timings_fake());
+    let listener = PtpListener::bind();
+    let (sender, _host) = ptp_sender(&listener);
+    let mut events = Events::default();
+    let dp = airplay2_only(&proven, 3, "0x0,0x10240");
+    let mut stored = options();
+    stored.timing = Some(TimingMemory::of(&dp, Timing::Ptp));
+    sender.add_speaker(dp.clone(), stored);
+    let da = airplay2_only(&first, 1, "0x0,0x10240");
+    sender.add_speaker(da.clone(), options());
+    assert_state(&mut events, &sender, &dp.key, 1, SpeakerState::Playing);
+    assert_state(&mut events, &sender, &da.key, 1, SpeakerState::Playing);
+    sender.add_speaker(db.clone(), options());
+    assert_state(&mut events, &sender, &db.key, 1, SpeakerState::Failed);
+    assert_eq!(setup_timings(&first), ["PTP"]);
+
+    sender.remove_speaker(&dp.key);
+    assert_state(&mut events, &sender, &db.key, 1, SpeakerState::Playing);
+    assert_eq!(setup_timings(&first), ["PTP", "NTP"]);
+    sender.shutdown();
+}
+
+// A speaker asked for PTP first that the host turned off holds the service
+// until its TEARDOWN is answered: an IPv6-only PTP-only speaker waits for
+// that, and the one turned off doesn't start again (P205).
+// covers: P205
+#[test]
+fn a_speaker_turned_off_is_not_started_again_to_free_the_service() {
+    let _serial = serial();
+    let Some((_second, db)) = ipv6_only(ptp_fake(), 2) else {
+        return;
+    };
+    let mut slow = both_timings_fake();
+    slow.pause
+        .insert("TEARDOWN".to_owned(), Duration::from_millis(800));
+    let first = Ap2Server::start(slow);
+    let listener = PtpListener::bind();
+    let (sender, _host) = ptp_sender(&listener);
+    let mut events = Events::default();
+    let da = airplay2_only(&first, 1, "0x0,0x10240");
+    sender.add_speaker(da.clone(), options());
+    assert_state(&mut events, &sender, &da.key, 1, SpeakerState::Playing);
+    sender.remove_speaker(&da.key);
+    sender.add_speaker(db.clone(), options());
+    assert_state(&mut events, &sender, &db.key, 1, SpeakerState::Playing);
+    assert_eq!(setup_timings(&first), ["PTP"]);
+    sender.shutdown();
+}
+
+// A pair member that takes both timings keeps PTP over IPv4 while its IPv6
+// member that takes only PTP waits: the pair keeps the service's family, so
+// giving it up would free nothing (P179, P205).
+// covers: P205
+#[test]
+fn a_pair_member_keeps_the_service_while_its_other_member_waits() {
+    let _serial = serial();
+    let Some((_second, db)) = ipv6_only(ptp_fake(), 2) else {
+        return;
+    };
+    let first = Ap2Server::start(both_timings_fake());
+    let listener = PtpListener::bind();
+    let (sender, _host) = ptp_sender(&listener);
+    let mut events = Events::default();
+    let da = airplay2_only(&first, 1, "0x0,0x10240");
+    let target = pair(vec![member(Some(&da), 1), member(Some(&db), 2)], None);
+    sender.add_target(target, options(), |_, _| {});
+    assert_state(&mut events, &sender, &da.key, 1, SpeakerState::Playing);
+    assert_state(&mut events, &sender, &db.key, 1, SpeakerState::Failed);
+    let connecting = |s: &SpeakerState| *s == SpeakerState::Connecting;
+    let again = events.wait_state(&sender, &da.key, 2, Duration::from_secs(1), connecting);
+    assert_eq!(again, None, "{:?}", events.of(&da.key));
+    assert_eq!(setup_timings(&first), ["PTP"]);
+    assert_one_clock_keeps_syncing(&listener);
     sender.shutdown();
 }
 

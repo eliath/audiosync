@@ -493,6 +493,10 @@ pub(crate) struct Driver {
     /// Speakers whose current session goes without PTP because the service
     /// runs in another family: a timing refusal from it is a wait (P205).
     ptp_excluded: BTreeSet<DeviceKey>,
+    /// Speakers started again to free the PTP service for a waiter: their
+    /// next session asks for NTP first and keeps the service until it is
+    /// answered, so one that refuses NTP takes PTP back (P205).
+    ntp_first: BTreeSet<DeviceKey>,
     /// The PTP service closed: receivers waiting for it start (P205).
     ptp_freed: bool,
     /// A receiver entered or left the SETPEERS list (P207, P209).
@@ -570,6 +574,7 @@ impl Driver {
             ptp_moved: BTreeMap::new(),
             ptp_retrying: BTreeSet::new(),
             ptp_excluded: BTreeSet::new(),
+            ntp_first: BTreeSet::new(),
             ptp_freed: false,
             peers_dirty: false,
             peers_set_up_again: BTreeSet::new(),
@@ -977,6 +982,8 @@ impl Driver {
                 progressed = true;
                 self.refresh_peers(now);
             }
+            // Only here, so a start the restarts set off can't run it again.
+            progressed |= self.free_ptp_for_waiter(now);
             if std::mem::take(&mut self.ptp_freed) {
                 progressed = true;
                 self.wake_ptp_waiters(now);

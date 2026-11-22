@@ -44,8 +44,9 @@ use crate::volume::Volume;
 
 /// The base latency Lf by default: 4410 frames, 0.1 s (P98).
 pub const DEFAULT_LATENCY_FRAMES: u32 = 4_410;
-/// The smallest Lf the host may set: 0.1 s (P98).
-pub const MIN_LATENCY_FRAMES: u32 = 4_410;
+/// The smallest Lf the host may set. Home build: 2 s, not 0.1 s (P98),
+/// because the WiiM Amp crackles below that.
+pub const MIN_LATENCY_FRAMES: u32 = 88_200;
 /// The largest Lf the host may set: 2.0 s (P98).
 pub const MAX_LATENCY_FRAMES: u32 = 88_200;
 /// The largest per-speaker delay (P99): the host's own 20 s delay range, so
